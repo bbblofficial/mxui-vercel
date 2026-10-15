@@ -5,45 +5,54 @@ import crypto from "node:crypto";
 import QRCode from "qrcode";
 import { WebSocketServer, createWebSocketStream } from "ws";
 import * as P from "../lib/pages.js";
+import { mode, run } from "../lib/store.js";
 
 const VERSION = "2.4.0", T0 = Date.now(), COOKIE = "mxui_session";
-const REST = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
-const TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN;
 const ENV_PW = process.env.ADMIN_PASSWORD || "";
-const KEY = "mxui:state", PROTOS = ["vless", "trojan"];
+const PROTOS = ["vless", "trojan"];
 const H = { "Cache-Control": "no-store" };
 
-/* ---------- state ---------- */
-let mem = null;
+/* ---------- state (Redis; every write is an atomic command) ---------- */
 const hex = (n) => crypto.randomBytes(n).toString("hex");
 const mk = (o = {}) => ({
   label: "Config", limit_bytes: 0, used_bytes: 0, up_bytes: 0, down_bytes: 0, created_at: new Date().toISOString(),
   active: true, expires_at: null, note: "", is_default: false, protocols: ["vless", "trojan"], fingerprint: "chrome",
   alpn: "", ip_limit: 0, speed_limit_bytes: 0, last_used: null, ...o,
 });
-async function load() {
-  let s = mem;
-  if (REST) {
-    const j = await (await fetch(`${REST}/get/${KEY}`, { headers: { Authorization: `Bearer ${TOKEN}` } })).json();
-    s = j.result ? JSON.parse(j.result) : null;
-  }
-  s = mem = s || { links: {}, pw: "", secret: hex(24), total: 0, reqs: 0, rejected: 0, series: {}, logs: [], activity: [] };
-  if (!Object.keys(s.links).length) { s.links[crypto.randomUUID()] = mk({ label: "Default", is_default: true }); await save(s); }
-  return s;
-}
-async function save(s) {
-  mem = s;
-  if (REST) await fetch(`${REST}/set/${KEY}`, { method: "POST", headers: { Authorization: `Bearer ${TOKEN}` }, body: JSON.stringify(s) });
-}
-const note = (s, kind, message, level = "info") => {
-  const time = new Date().toISOString();
-  s.activity.push({ time, kind, message, level }); s.activity = s.activity.slice(-100);
-  s.logs.push({ time, level, msg: `[${kind}] ${message}` }); s.logs = s.logs.slice(-500);
-};
+const stored = (l) => { const { used_bytes, up_bytes, down_bytes, last_used, ...r } = l; return JSON.stringify(r); };
+const putLink = (u, l) => ["HSET", "mxui:links", u, stored(l)];
+const dropUse = (u) => ["HDEL", "mxui:use", u + "|used", u + "|up", u + "|last"];
+const logCmds = (kind, message, level = "info") => [
+  ["LPUSH", "mxui:logs", JSON.stringify({ time: new Date().toISOString(), level, msg: `[${kind}] ${message}`, kind, message })],
+  ["LTRIM", "mxui:logs", 0, 499]];
+const pairs = (x) => { if (!Array.isArray(x)) return x || {}; const o = {}; for (let i = 0; i < x.length; i += 2) o[x[i]] = x[i + 1]; return o; };
 
-/* ---------- auth ---------- */
-const secretOf = (s) => `${process.env.SECRET || ""}${ENV_PW ? "env:" + ENV_PW : s.secret}`;
-const sign = (s, t) => crypto.createHmac("sha256", secretOf(s)).update(t).digest("hex");
+let boot = null; // per-instance cache of the one immutable secret
+async function init() {
+  if (boot) return boot;
+  const [, secret] = await run([["SET", "mxui:secret", hex(24), "NX"], ["GET", "mxui:secret"]]);
+  const h = crypto.createHash("sha256").update("default:" + secret).digest("hex");
+  return (boot = { secret, defId: `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-a${h.slice(17, 20)}-${h.slice(20, 32)}` });
+}
+async function load() {
+  const { secret, defId } = await init();
+  const [, links, use, st, pw, logs] = await run([
+    ["HSETNX", "mxui:links", defId, JSON.stringify(mk({ label: "Default", is_default: true }))],
+    ["HGETALL", "mxui:links"], ["HGETALL", "mxui:use"], ["HGETALL", "mxui:stats"], ["GET", "mxui:pw"], ["LRANGE", "mxui:logs", 0, 499]]);
+  const U = pairs(use), X = pairs(st), L = {}, series = {};
+  for (const [u, j] of Object.entries(pairs(links))) {
+    const l = mk(JSON.parse(j)); l.used_bytes = +U[u + "|used"] || 0; l.up_bytes = +U[u + "|up"] || 0;
+    l.down_bytes = Math.max(0, l.used_bytes - l.up_bytes); l.last_used = U[u + "|last"] || null; L[u] = l;
+  }
+  for (const [k, v] of Object.entries(X)) if (k.startsWith("h:")) series[k.slice(2)] = +v;
+  const lg = (logs || []).map((x) => JSON.parse(x)).reverse();
+  return { links: L, pw: pw || "", secret, total: +X.total || 0, reqs: +X.reqs || 0, rejected: +X.rejected || 0, series, logs: lg,
+    activity: lg.filter((x) => x.kind).map((x) => ({ time: x.time, kind: x.kind, message: x.message, level: x.level })) };
+}
+
+/* ---------- auth (stateless signed cookie; key = secret + password, so a password change signs everyone out) ---------- */
+const keyOf = (s) => `${process.env.SECRET || ""}|${s.secret}|${ENV_PW ? "env:" + ENV_PW : s.pw}`;
+const sign = (s, t) => crypto.createHmac("sha256", keyOf(s)).update(t).digest("hex");
 const setupDone = (s) => !!(ENV_PW || s.pw);
 function authed(req, s) {
   const m = new RegExp(`(?:^|; )${COOKIE}=(\\d+)\\.([a-f0-9]+)`).exec(req.headers.cookie || "");
@@ -53,14 +62,15 @@ function authed(req, s) {
 }
 const hashPw = (pw) => { const salt = hex(8); return `scrypt$${salt}$${crypto.scryptSync(pw, salt, 32).toString("hex")}`; };
 function checkPw(s, pw) {
-  const a = ENV_PW ? crypto.createHash("sha256").update(ENV_PW).digest() : null;
-  if (a) return crypto.timingSafeEqual(crypto.createHash("sha256").update(pw).digest(), a);
+  if (ENV_PW) return crypto.timingSafeEqual(crypto.createHash("sha256").update(pw).digest(), crypto.createHash("sha256").update(ENV_PW).digest());
   const [, salt, h] = (s.pw || "").split("$");
   return !!h && crypto.timingSafeEqual(crypto.scryptSync(pw, salt, 32), Buffer.from(h, "hex"));
 }
-const cookie = (s) => { const t = String(Date.now()); return `${COOKIE}=${t}.${sign(s, t)}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=604800`; };
+const https = (req) => String(req.headers["x-forwarded-proto"] || "").split(",")[0] === "https";
+const cookie = (s, req) => { const t = String(Date.now()); return `${COOKIE}=${t}.${sign(s, t)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800${https(req) ? "; Secure" : ""}`; };
 const fails = new Map();
 const limited = (ip) => (fails.get(ip) || []).filter((t) => t > Date.now() - 6e5).length >= 8;
+const NO_STORE = `<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>MX-UI setup</title><body style="font:15px/1.6 system-ui;max-width:560px;margin:60px auto;padding:0 20px"><h2>MX-UI needs a Redis database</h2><p>On Vercel every request may hit a different server, so the panel keeps its state (password, configs, usage) in Redis.</p><ol><li>Vercel project &rarr; <b>Storage</b> &rarr; add <b>Upstash Redis</b> (free plan is fine) and connect it to this project.</li><li><b>Redeploy</b>, then open <code>/setup</code>.</li></ol><p>Optional: set <code>ADMIN_PASSWORD</code> to skip the setup page.</p>`;
 
 /* ---------- links ---------- */
 const derive = (s, tag, uid) => crypto.createHash("sha256").update(`${tag}:${uid}:${s.secret}`).digest("hex").slice(0, 24);
@@ -139,6 +149,7 @@ const ipOf = (req) => String(req.headers["x-forwarded-for"] || req.socket.remote
 const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url, "http://x"), p = url.pathname, M = req.method;
+    if (mode === "none" && p !== "/health") return out(res, 503, NO_STORE, "text/html");
     const s = await load(), auth = authed(req, s);
     let m;
     if (p === "/health" || p === "/healthz" || p === "/readyz") return out(res, 200, { status: "ok" });
@@ -167,8 +178,10 @@ const server = createServer(async (req, res) => {
       if (setupDone(s)) return err(res, 403, "Already set up");
       const pw = String((await body(req)).password || "");
       if (pw.length < 6) return err(res, 400, "Password needs 6+ characters");
-      s.pw = hashPw(pw); note(s, "auth", "Panel set up", "ok"); await save(s);
-      return out(res, 200, { ok: true }, "application/json", { "Set-Cookie": cookie(s) });
+      const hp = hashPw(pw), [r] = await run([["SET", "mxui:pw", hp, "NX"]]);
+      if (r !== "OK") return err(res, 403, "Setup is already complete");
+      s.pw = hp; await run(logCmds("auth", "Admin password set", "ok"));
+      return out(res, 200, { ok: true }, "application/json", { "Set-Cookie": cookie(s, req) });
     }
     if (p === "/api/login" && M === "POST") {
       if (!setupDone(s)) return err(res, 403, "Setup required");
@@ -178,7 +191,7 @@ const server = createServer(async (req, res) => {
         return err(res, 401, "Wrong password");
       }
       fails.delete(ip);
-      return out(res, 200, { ok: true }, "application/json", { "Set-Cookie": cookie(s) });
+      return out(res, 200, { ok: true }, "application/json", { "Set-Cookie": cookie(s, req) });
     }
     if (p === "/api/logout") return out(res, 200, { ok: true }, "application/json", { "Set-Cookie": `${COOKIE}=; Path=/; HttpOnly; Secure; Max-Age=0` });
 
@@ -189,7 +202,7 @@ const server = createServer(async (req, res) => {
         if (ENV_PW) return err(res, 400, "Password is managed by the ADMIN_PASSWORD environment variable");
         if (!checkPw(s, String(b.current_password || ""))) return err(res, 401, "Current password is wrong");
         if (String(b.new_password || "").length < 6) return err(res, 400, "New password needs 6+ characters");
-        s.pw = hashPw(b.new_password); s.secret = hex(24); await save(s);
+        await run([["SET", "mxui:pw", hashPw(b.new_password)]]);
         return out(res, 200, { ok: true }, "application/json", { "Set-Cookie": `${COOKIE}=; Path=/; Max-Age=0` });
       }
       if (p === "/sub-all") {
@@ -216,20 +229,25 @@ const server = createServer(async (req, res) => {
       if (p === "/api/links" && M === "POST") {
         const b = await body(req), uid = crypto.randomUUID(), l = mk();
         try { applyLimits(l, { ...b, label: b.label || `Config ${Object.keys(s.links).length + 1}` }); } catch (e) { return err(res, 400, e.message); }
-        s.links[uid] = l; note(s, "config", `Created ${l.label}`, "ok"); await save(s);
+        s.links[uid] = l; await run([putLink(uid, l), ...logCmds("config", `Created ${l.label}`, "ok")]);
         return out(res, 200, pub(s, conns, uid, l, req));
       }
       if ((m = /^\/api\/links\/([0-9a-f-]{36})(\/toggle|\/reset-traffic)?$/.exec(p))) {
         const uid = m[1], l = s.links[uid]; if (!l) return err(res, 404, "Config not found");
-        const b = M === "DELETE" || m[2] === "/reset-traffic" ? {} : await body(req);
-        if (M === "DELETE") { if (l.is_default) return err(res, 403, "The default config can't be deleted"); delete s.links[uid]; note(s, "config", `Deleted ${l.label}`, "warn"); }
-        else if (m[2] === "/toggle") { l.active = "active" in b ? !!b.active : !l.active; note(s, "config", `${l.label} ${l.active ? "enabled" : "disabled"}`); }
-        else if (m[2]) l.used_bytes = l.up_bytes = l.down_bytes = 0;
-        else { const k = l.is_default ? ["active", "fingerprint", "alpn", "protocols"] : null;
+        const b = M === "DELETE" || m[2] === "/reset-traffic" ? {} : await body(req), cmds = [];
+        if (M === "DELETE") {
+          if (l.is_default) return err(res, 403, "The default config can't be deleted");
+          cmds.push(["HDEL", "mxui:links", uid], dropUse(uid), ...logCmds("config", `Deleted ${l.label}`, "warn"));
+        } else if (m[2] === "/reset-traffic") { l.used_bytes = l.up_bytes = l.down_bytes = 0; cmds.push(["HSET", "mxui:use", uid + "|used", 0, uid + "|up", 0]); }
+        else if (m[2] === "/toggle") { l.active = "active" in b ? !!b.active : !l.active; cmds.push(putLink(uid, l), ...logCmds("config", `${l.label} ${l.active ? "enabled" : "disabled"}`)); }
+        else {
+          const k = l.is_default ? ["active", "fingerprint", "alpn", "protocols"] : null;
           const bb = k ? Object.fromEntries(Object.entries(b).filter(([x]) => k.includes(x))) : b;
           if ("active" in bb) l.active = !!bb.active;
-          try { applyLimits(l, bb); } catch (e) { return err(res, 400, e.message); } }
-        await save(s);
+          try { applyLimits(l, bb); } catch (e) { return err(res, 400, e.message); }
+          cmds.push(putLink(uid, l));
+        }
+        await run(cmds);
         return out(res, 200, M === "PATCH" && !m[2] ? pub(s, conns, uid, l, req) : m[2] === "/toggle" ? { ok: true, active: l.active } : { ok: true });
       }
       if (p === "/api/connections") return out(res, 200, { connections: [...conns.entries()].map(([id, c]) => ({ id, uuid: c.uuid, label: s.links[c.uuid]?.label || "?", proto: c.proto, ip: c.ip, since: c.since, up: c.up, down: c.down })).sort((a, b) => b.since - a.since) });
@@ -241,16 +259,21 @@ const server = createServer(async (req, res) => {
       if (p === "/api/database/export") return out(res, 200, { version: VERSION, exported_at: new Date().toISOString(), links: s.links }, "application/json", { "Content-Disposition": 'attachment; filename="mx-ui-backup.json"' });
       if (p === "/api/database/import") {
         const b = await body(req); if (!b.links || typeof b.links !== "object") return err(res, 400, "Backup file has no 'links' object");
-        if (b.mode === "replace") for (const u of Object.keys(s.links)) if (!s.links[u].is_default) delete s.links[u];
+        const cmds = [];
+        if (b.mode === "replace") for (const [u, x] of Object.entries(s.links)) if (!x.is_default) { cmds.push(["HDEL", "mxui:links", u], dropUse(u)); delete s.links[u]; }
         let n = 0;
-        for (const [u, l] of Object.entries(b.links)) { if (!/^[0-9a-f-]{36}$/.test(u) || typeof l !== "object") continue; s.links[u] = mk({ ...l, protocols: PROTOS.filter((x) => (l.protocols || []).includes(x)).length ? PROTOS.filter((x) => l.protocols.includes(x)) : PROTOS, is_default: !!l.is_default && !Object.values(s.links).some((x) => x.is_default) }); n++; }
-        note(s, "backup", `Imported ${n} configs (${b.mode || "merge"})`, "ok"); await save(s);
+        for (const [u, l] of Object.entries(b.links)) {
+          if (!/^[0-9a-f-]{36}$/.test(u) || !l || typeof l !== "object") continue;
+          const pr = PROTOS.filter((x) => [].concat(l.protocols || []).includes(x)), nl = mk({ ...l, protocols: pr.length ? pr : PROTOS, is_default: !!s.links[u]?.is_default });
+          cmds.push(putLink(u, nl), ["HSET", "mxui:use", u + "|used", +l.used_bytes || 0, u + "|up", +l.up_bytes || 0]); s.links[u] = nl; n++;
+        }
+        cmds.push(...logCmds("backup", `Imported ${n} configs (${b.mode || "merge"})`, "ok")); await run(cmds);
         return out(res, 200, { ok: true, imported: n });
       }
       if (p === "/api/logs") { const lv = url.searchParams.get("level"), lim = +url.searchParams.get("limit") || 300; return out(res, 200, { logs: s.logs.filter((x) => !lv || x.level === lv).slice(-lim), activity: s.activity }); }
       if (p === "/api/logs/ports") return out(res, 200, { xray_running: true, listening: { 443: true } });
       if (p.startsWith("/api/logs/files/")) return out(res, 200, { lines: [] });
-      if (p === "/api/logs/clear") { s.logs = []; s.activity = []; await save(s); return out(res, 200, { ok: true }); }
+      if (p === "/api/logs/clear") { await run([["DEL", "mxui:logs"]]); return out(res, 200, { ok: true }); }
     }
     err(res, 404, "Not found");
   } catch (e) { err(res, 500, "Server error"); }
@@ -289,10 +312,10 @@ function onTunnel(ws, req, path) {
       if (proto === "vless") { h = parseVless(buf); uid = h.uid; }
       else { h = parseTrojan(buf); uid = Object.keys(s.links).find((u) => crypto.createHash("sha224").update(trojanPw(s, u)).digest("hex") === h.hash); }
       const l = s.links[uid], live = [...conns.values()].filter((c) => c.uuid === uid);
-      s.reqs++;
+      run([["HINCRBY", "mxui:stats", "reqs", 1]]).catch(() => {});
       const bad = !l || h.cmd !== 1 || stateOf(l) !== "active" || !l.protocols.includes(proto)
         || (l.ip_limit > 0 && !live.some((c) => c.ip === ip) && new Set(live.map((c) => c.ip)).size >= l.ip_limit);
-      if (bad) { s.rejected++; await save(s); return ws.close(); }
+      if (bad) { run([["HINCRBY", "mxui:stats", "rejected", 1]]).catch(() => {}); return ws.close(); }
       const id = hex(4), c = { uuid: uid, ip, proto, since: Date.now(), up: buf.length - h.offset, down: 0 };
       conns.set(id, c);
       if (h.reply) ws.send(h.reply);
@@ -302,9 +325,11 @@ function onTunnel(ws, req, path) {
       let done = false;
       const end = async () => {
         if (done) return; done = true; conns.delete(id); sock.destroy(); ws.terminate();
-        try { const t = c.up + c.down, s2 = await load(), l2 = s2.links[uid], k = new Date().toISOString().slice(0, 13);
-          if (l2 && t) { l2.used_bytes += t; l2.up_bytes += c.up; l2.last_used = new Date().toISOString(); s2.total += t; s2.series[k] = (s2.series[k] || 0) + t;
-            Object.keys(s2.series).sort().slice(0, -48).forEach((x) => delete s2.series[x]); await save(s2); } } catch {}
+        try {
+          const t = c.up + c.down, now = new Date().toISOString();
+          if (t) await run([["HINCRBY", "mxui:use", uid + "|used", t], ["HINCRBY", "mxui:use", uid + "|up", c.up], ["HSET", "mxui:use", uid + "|last", now],
+            ["HINCRBY", "mxui:stats", "total", t], ["HINCRBY", "mxui:stats", "h:" + now.slice(0, 13), t]]);
+        } catch {}
       };
       duplex.on("error", () => {}); sock.on("error", () => {}); sock.on("close", end); duplex.on("close", end);
     } catch { ws.close(); }
