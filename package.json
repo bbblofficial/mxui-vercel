@@ -1,0 +1,9 @@
+{
+  "name": "mx-ui-vercel",
+  "version": "2.4.0",
+  "private": true,
+  "type": "module",
+  "scripts": { "dev": "vercel dev", "start": "node scripts/local.js" },
+  "dependencies": { "qrcode": "^1.5.4", "ws": "^8.21.0" },
+  "engines": { "node": ">=18" }
+}
